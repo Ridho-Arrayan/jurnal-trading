@@ -1,0 +1,1460 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lazy Trader Journal</title>
+
+<!-- Firebase SDK -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, onAuthStateChanged, signInWithPopup, signInWithEmailAndPassword,
+         createUserWithEmailAndPassword, GoogleAuthProvider, signOut, updateProfile }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, collection, doc, addDoc, getDocs, getDoc, setDoc,
+         deleteDoc, updateDoc, query, orderBy, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+// ════════════════════════════════════════════════
+//  🔥 PASTE FIREBASE CONFIG KAMU DI SINI
+// ════════════════════════════════════════════════
+const firebaseConfig = {
+  apiKey:            "AIzaSyBAPAxVFMGloJ9cuWZpL3azYQ6xnsYNpNQ",
+  authDomain:        "lazy-trader-journal.firebaseapp.com",
+  projectId:         "lazy-trader-journal",
+  storageBucket:     "lazy-trader-journal.firebasestorage.app",
+  messagingSenderId: "683262906766",
+  appId:             "1:683262906766:web:bab5ac4b08874b367a54df"
+};
+// ════════════════════════════════════════════════
+
+const app  = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db   = getFirestore(app);
+const gProvider = new GoogleAuthProvider();
+
+// ── State ──
+let currentUser    = null;
+let currentAccount = null; // { id, name, description }
+let allAccounts    = [];
+let trades         = [];
+let emotions       = ['Confident','FOMO','Tenang','Ngantuk','Takut','Greed','Happy','Stres','Fokus','Ragu'];
+let selEmoBefore   = null;
+let selEmoAfter    = null;
+let selResult      = null;
+let selGrade       = null;
+let emoModalTarget = 'before';
+let chartInstances = {};
+let editingTradeId = null;
+
+// ── Auth State ──
+onAuthStateChanged(auth, async user => {
+  if (user) {
+    currentUser = user;
+    showApp();
+    await loadUserEmotions();
+    await loadAccounts();
+  } else {
+    currentUser = null;
+    showAuth();
+  }
+});
+
+// ════════════════════════════════════════════════
+//  AUTH
+// ════════════════════════════════════════════════
+window.doGoogleLogin = async () => {
+  try {
+    setBtnLoading('btn-google-login', true);
+    await signInWithPopup(auth, gProvider);
+  } catch(e) {
+    showToast('Login Google gagal: ' + e.message, 'error');
+    setBtnLoading('btn-google-login', false);
+  }
+};
+
+window.doGoogleRegister = async () => {
+  try {
+    setBtnLoading('btn-google-reg', true);
+    await signInWithPopup(auth, gProvider);
+  } catch(e) {
+    showToast('Daftar Google gagal: ' + e.message, 'error');
+    setBtnLoading('btn-google-reg', false);
+  }
+};
+
+window.doEmailLogin = async () => {
+  const email = val('l-email');
+  const pass  = val('l-pass');
+  if (!email || !pass) { showToast('Isi email & password!', 'error'); return; }
+  try {
+    setBtnLoading('btn-email-login', true);
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch(e) {
+    const msg = e.code === 'auth/invalid-credential' ? 'Email atau password salah!'
+              : e.code === 'auth/user-not-found'     ? 'Akun tidak ditemukan!'
+              : e.message;
+    showToast(msg, 'error');
+    setBtnLoading('btn-email-login', false);
+  }
+};
+
+window.doEmailRegister = async () => {
+  const name  = val('r-name');
+  const email = val('r-email');
+  const pass  = val('r-pass');
+  if (!name || !email || !pass) { showToast('Isi semua field!', 'error'); return; }
+  if (pass.length < 8) { showToast('Password minimal 8 karakter!', 'error'); return; }
+  try {
+    setBtnLoading('btn-email-reg', true);
+    const cred = await createUserWithEmailAndPassword(auth, email, pass);
+    await updateProfile(cred.user, { displayName: name });
+  } catch(e) {
+    const msg = e.code === 'auth/email-already-in-use' ? 'Email sudah terdaftar!'
+              : e.code === 'auth/weak-password'        ? 'Password terlalu lemah!'
+              : e.message;
+    showToast(msg, 'error');
+    setBtnLoading('btn-email-reg', false);
+  }
+};
+
+window.doLogout = async () => {
+  showConfirm({
+    icon: '👋',
+    title: 'Yakin mau logout?',
+    message: 'Kamu akan keluar dari sesi ini.',
+    confirmText: 'Logout',
+    danger: true,
+    onConfirm: async () => {
+      await signOut(auth);
+      currentAccount = null;
+      allAccounts    = [];
+      trades         = [];
+      closeProfilePanel();
+    }
+  });
+};
+
+// ════════════════════════════════════════════════
+//  FIRESTORE HELPERS
+// ════════════════════════════════════════════════
+const userDoc  = () => doc(db, 'users', currentUser.uid);
+const acctCol  = () => collection(db, 'users', currentUser.uid, 'accounts');
+const acctDoc  = id => doc(db, 'users', currentUser.uid, 'accounts', id);
+const tradeCol = id => collection(db, 'users', currentUser.uid, 'accounts', id, 'trades');
+const tradeDocRef = (aId, tId) => doc(db, 'users', currentUser.uid, 'accounts', aId, 'trades', tId);
+
+// ── User emotions (custom) ──
+async function loadUserEmotions() {
+  try {
+    const snap = await getDoc(userDoc());
+    if (snap.exists() && snap.data().emotions) {
+      emotions = snap.data().emotions;
+    }
+  } catch(e) {}
+}
+
+async function saveUserEmotions() {
+  try { await setDoc(userDoc(), { emotions }, { merge: true }); } catch(e) {}
+}
+
+// ── Accounts ──
+async function loadAccounts() {
+  showLoading(true);
+  try {
+    const snap = await getDocs(query(acctCol(), orderBy('createdAt','desc')));
+    allAccounts = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (allAccounts.length === 0) {
+      showPage('accounts');
+      renderAccountsPage();
+    } else {
+      // auto-select first account
+      await selectAccount(allAccounts[0].id);
+    }
+  } catch(e) {
+    showToast('Gagal load akun: ' + e.message, 'error');
+  }
+  showLoading(false);
+}
+
+async function selectAccount(id) {
+  currentAccount = allAccounts.find(a => a.id === id);
+  if (!currentAccount) return;
+  renderTopbarAccount();
+  await loadTrades();
+  showPage('dashboard');
+  setActiveNav('dashboard');
+  renderDashboard();
+}
+
+window.createAccount = async () => {
+  const name = val('new-acct-name').trim();
+  const desc = val('new-acct-desc').trim();
+  if (!name) { showToast('Nama akun wajib diisi!', 'error'); return; }
+  try {
+    setBtnLoading('btn-create-acct', true);
+    const ref = await addDoc(acctCol(), { name, description: desc, createdAt: serverTimestamp() });
+    const newAcct = { id: ref.id, name, description: desc };
+    allAccounts.unshift(newAcct);
+    await selectAccount(ref.id);
+    closeModal('modal-new-acct');
+    showToast('Akun "' + name + '" berhasil dibuat!', 'success');
+  } catch(e) {
+    showToast('Gagal buat akun: ' + e.message, 'error');
+  }
+  setBtnLoading('btn-create-acct', false);
+};
+
+window.deleteAccount = async (id) => {
+  const acct = allAccounts.find(a => a.id === id);
+  showConfirm({
+    icon: '🗑️',
+    title: 'Hapus Akun?',
+    message: `Akun <strong>${acct?.name}</strong> dan semua jurnalnya akan terhapus permanen.`,
+    confirmText: 'Hapus Akun',
+    danger: true,
+    onConfirm: async () => {
+  try {
+    // delete all trades first
+    const tSnap = await getDocs(tradeCol(id));
+    await Promise.all(tSnap.docs.map(d => deleteDoc(d.ref)));
+    await deleteDoc(acctDoc(id));
+    allAccounts = allAccounts.filter(a => a.id !== id);
+    if (allAccounts.length === 0) {
+      currentAccount = null;
+      trades = [];
+      showPage('accounts');
+      renderAccountsPage();
+    } else {
+      await selectAccount(allAccounts[0].id);
+    }
+      showToast('Akun dihapus.', 'success');
+    } catch(e) {
+      showToast('Gagal hapus akun: ' + e.message, 'error');
+    }
+    }
+  });
+};
+
+// ── Trades ──
+async function loadTrades() {
+  if (!currentAccount) return;
+  try {
+    const snap = await getDocs(query(tradeCol(currentAccount.id), orderBy('date','desc')));
+    trades = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  } catch(e) {
+    trades = [];
+  }
+}
+
+window.submitJournal = async () => {
+  if (!currentAccount) { showToast('Pilih akun dulu!', 'error'); return; }
+  const date   = val('f-date');
+  const pair   = val('f-pair').toUpperCase().trim();
+  const reason = val('f-reason').trim();
+  if (!pair || !reason || !selEmoBefore) {
+    showToast('Wajib isi: Pair, Reason, & Emosi Sebelum!', 'error'); return;
+  }
+  const payload = {
+    date, pair, reason,
+    emoBefore:     selEmoBefore,
+    emoBeforeDesc: val('f-emo-before-desc').trim(),
+    emoAfter:      selEmoAfter,
+    emoAfterDesc:  val('f-emo-after-desc').trim(),
+    result:        selResult,
+    grade:         selGrade,
+    lesson:        val('f-lesson').trim(),
+    createdAt:     serverTimestamp(),
+  };
+  try {
+    setBtnLoading('btn-submit', true);
+    if (editingTradeId) {
+      await updateDoc(tradeDocRef(currentAccount.id, editingTradeId), payload);
+      showToast('Jurnal diperbarui!', 'success');
+      editingTradeId = null;
+    } else {
+      await addDoc(tradeCol(currentAccount.id), payload);
+      showToast('Jurnal tersimpan!', 'success');
+    }
+    resetForm();
+    await loadTrades();
+    goPage('dashboard');
+  } catch(e) {
+    showToast('Gagal simpan: ' + e.message, 'error');
+  }
+  setBtnLoading('btn-submit', false);
+};
+
+window.deleteTrade = async (id) => {
+  showConfirm({
+    icon: '🗑️',
+    title: 'Hapus Jurnal?',
+    message: 'Trade ini akan dihapus permanen dan tidak bisa dikembalikan.',
+    confirmText: 'Hapus',
+    danger: true,
+    onConfirm: async () => {
+      try {
+        await deleteDoc(tradeDocRef(currentAccount.id, id));
+        trades = trades.filter(t => t.id !== id);
+        closeModal('modal-detail');
+        renderHistory();
+        renderDashboard();
+        showToast('Jurnal dihapus.', 'success');
+      } catch(e) {
+        showToast('Gagal hapus: ' + e.message, 'error');
+      }
+    }
+  });
+};
+
+window.editTrade = (id) => {
+  const t = trades.find(x => x.id === id);
+  if (!t) return;
+  editingTradeId = id;
+  closeModal('modal-detail');
+  goPage('journal');
+  setTimeout(() => {
+    setVal('f-date', t.date || '');
+    setVal('f-pair', t.pair || '');
+    setVal('f-reason', t.reason || '');
+    setVal('f-emo-before-desc', t.emoBeforeDesc || '');
+    setVal('f-emo-after-desc', t.emoAfterDesc || '');
+    setVal('f-lesson', t.lesson || '');
+    selEmoBefore = t.emoBefore || null;
+    selEmoAfter  = t.emoAfter  || null;
+    selResult    = t.result    || null;
+    selGrade     = t.grade     || null;
+    renderEmoPicker('emo-before-picker','before');
+    renderEmoPicker('emo-after-picker','after');
+    if (selResult) {
+      ['win','loss','be'].forEach(r => $('btn-'+r).className='result-btn');
+      $('btn-'+selResult).classList.add('sel-'+selResult);
+    }
+    if (selGrade) {
+      $$('.grade-btn').forEach((b,i) => b.classList.toggle('selected', i+1===selGrade));
+    }
+    $('form-title').textContent = 'Edit Jurnal';
+    $('btn-submit').textContent = 'SIMPAN PERUBAHAN →';
+  }, 50);
+};
+
+// ════════════════════════════════════════════════
+//  UI HELPERS
+// ════════════════════════════════════════════════
+const $ = id => document.getElementById(id);
+const $$ = sel => document.querySelectorAll(sel);
+const val = id => ($$(id).length ? $$(id)[0] : $(id))?.value || '';
+const setVal = (id, v) => { if ($(id)) $(id).value = v; };
+
+function showApp() {
+  $('auth-screen').style.display = 'none';
+  $('app').style.display = 'flex';
+  const name     = currentUser.displayName || currentUser.email?.split('@')[0] || 'Trader';
+  const initials = name.slice(0,2).toUpperCase();
+  const avatarBtn = $('avatar-btn');
+  const photoURL  = currentUser.photoURL;
+  if (photoURL) {
+    avatarBtn.innerHTML = `<img src="${photoURL}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`;
+  } else {
+    avatarBtn.textContent = initials;
+  }
+  avatarBtn.title = name + ' — klik untuk profil';
+}
+
+function showAuth() {
+  $('auth-screen').style.display = 'flex';
+  $('app').style.display = 'none';
+}
+
+function showLoading(on) {
+  $('loading-overlay').style.display = on ? 'flex' : 'none';
+}
+
+function showPage(name) {
+  $$('.page').forEach(p => p.classList.remove('active'));
+  $('page-' + name)?.classList.add('active');
+}
+
+function setActiveNav(name) {
+  $$('.nav-btn').forEach(b => b.classList.remove('active'));
+  $('nav-' + name)?.classList.add('active');
+}
+
+function setBtnLoading(id, on) {
+  const btn = $(id);
+  if (!btn) return;
+  btn.disabled = on;
+  btn.style.opacity = on ? '.6' : '1';
+}
+
+function renderTopbarAccount() {
+  if (!currentAccount) return;
+  $('topbar-acct-name').textContent = currentAccount.name;
+}
+
+// ════════════════════════════════════════════════
+//  NAVIGATION
+// ════════════════════════════════════════════════
+window.goPage = async (name) => {
+  if (!currentAccount && name !== 'accounts') {
+    showToast('Pilih atau buat akun dulu!', 'error');
+    goPage('accounts');
+    return;
+  }
+  showPage(name);
+  setActiveNav(name);
+  if (name === 'dashboard')  renderDashboard();
+  if (name === 'history')    renderHistory();
+  if (name === 'analytics')  renderAnalytics();
+  if (name === 'journal')    initForm();
+  if (name === 'accounts')   renderAccountsPage();
+};
+
+// ════════════════════════════════════════════════
+//  ACCOUNTS PAGE
+// ════════════════════════════════════════════════
+function renderAccountsPage() {
+  const el = $('accounts-list');
+  if (!el) return;
+  if (!allAccounts.length) {
+    el.innerHTML = `<div class="empty-state">
+      <div class="empty-icon">📂</div>
+      <p>Belum ada akun jurnal.<br>Buat akun pertama kamu untuk mulai jurnaling!</p>
+    </div>`;
+    return;
+  }
+  el.innerHTML = allAccounts.map(a => `
+    <div class="acct-card ${currentAccount?.id===a.id?'active-acct':''}">
+      <div class="acct-card-left" onclick="selectAccount('${a.id}')">
+        <div class="acct-icon">${a.name.slice(0,2).toUpperCase()}</div>
+        <div>
+          <div class="acct-name">${a.name}</div>
+          ${a.description ? `<div class="acct-desc">${a.description}</div>` : ''}
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        ${currentAccount?.id===a.id ? '<span class="badge-active">Aktif</span>' : ''}
+        <button class="btn-icon-danger" onclick="deleteAccount('${a.id}')" title="Hapus akun">🗑</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+window.selectAccount = async (id) => {
+  showLoading(true);
+  await selectAccount_internal(id);
+  showLoading(false);
+};
+
+async function selectAccount_internal(id) {
+  currentAccount = allAccounts.find(a => a.id === id);
+  if (!currentAccount) return;
+  renderTopbarAccount();
+  renderAccountsPage();
+  await loadTrades();
+  showPage('dashboard');
+  setActiveNav('dashboard');
+  renderDashboard();
+}
+
+// ════════════════════════════════════════════════
+//  DASHBOARD
+// ════════════════════════════════════════════════
+function renderDashboard() {
+  if (!currentAccount) return;
+  $('dash-acct-name').textContent = currentAccount.name;
+
+  const total  = trades.length;
+  const wins   = trades.filter(t => t.result === 'win').length;
+  const losses = trades.filter(t => t.result === 'loss').length;
+  const wr     = total > 0 ? Math.round(wins / total * 100) : 0;
+  const grades = trades.filter(t => t.grade).map(t => t.grade);
+  const avgGrade = grades.length ? (grades.reduce((s,v)=>s+v,0)/grades.length).toFixed(1) : '—';
+
+  $('s-total').textContent = total;
+  $('s-wr').textContent    = wr + '%';
+  $('s-grade').textContent = avgGrade;
+
+  const emoStats = calcEmoStats();
+  let bestEmo = '—', bestWR = -1;
+  for (const [emo, st] of Object.entries(emoStats)) {
+    if (st.total >= 2 && st.wins/st.total > bestWR) { bestWR = st.wins/st.total; bestEmo = emo; }
+  }
+  $('s-best').textContent = bestEmo;
+
+  if (total === 0) {
+    $('dashboard-empty').style.display = 'block';
+    $('dashboard-charts').style.display = 'none';
+    $('recent-trades').innerHTML = '';
+  } else {
+    $('dashboard-empty').style.display = 'none';
+    $('dashboard-charts').style.display = 'grid';
+    renderDonut(emoStats);
+    renderBarChart(emoStats);
+    renderRecentTrades();
+  }
+}
+
+function calcEmoStats() {
+  const stats = {};
+  trades.forEach(t => {
+    if (!t.emoBefore) return;
+    if (!stats[t.emoBefore]) stats[t.emoBefore] = { wins:0, losses:0, total:0 };
+    stats[t.emoBefore].total++;
+    if (t.result === 'win') stats[t.emoBefore].wins++;
+    else stats[t.emoBefore].losses++;
+  });
+  return stats;
+}
+
+const COLORS = ['#7B68EE','#4ADE80','#F87171','#FBBF24','#60A5FA','#F472B6','#34D399','#A78BFA','#FB923C'];
+
+function renderDonut(emoStats) {
+  const area = $('donut-area');
+  const entries = Object.entries(emoStats);
+  if (!entries.length) { area.innerHTML = '<div style="color:var(--text3);font-size:13px">Belum ada data.</div>'; return; }
+  const total = entries.reduce((s,[,v]) => s+v.total, 0);
+  const cx=60,cy=60,r=42,sw=16, circ=2*Math.PI*r;
+  let offset=0, svgC='';
+  entries.forEach(([,st],i) => {
+    const pct=st.total/total, dash=pct*circ, gap=circ-dash, rot=offset*360-90;
+    svgC+=`<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${COLORS[i%COLORS.length]}" stroke-width="${sw}" stroke-dasharray="${dash.toFixed(2)} ${gap.toFixed(2)}" transform="rotate(${rot.toFixed(2)} ${cx} ${cy})"/>`;
+    offset+=pct;
+  });
+  const svg=`<svg width="120" height="120" viewBox="0 0 120 120" style="flex-shrink:0">${svgC}<text x="60" y="56" text-anchor="middle" font-family="Space Mono,monospace" font-size="20" font-weight="700" fill="#F0F0F8">${total}</text><text x="60" y="72" text-anchor="middle" font-size="10" fill="#9090A8">trades</text></svg>`;
+  const legend=`<div class="donut-legend">${entries.slice(0,6).map(([emo,st],i)=>{
+    const wr=Math.round(st.wins/st.total*100);
+    return `<div class="legend-row"><div class="legend-dot" style="background:${COLORS[i%COLORS.length]}"></div><span class="legend-label">${emo}</span><span class="legend-val">${wr}% win</span></div>`;
+  }).join('')}</div>`;
+  area.innerHTML = svg+legend;
+}
+
+function renderBarChart(emoStats) {
+  const area=$('bar-chart-area');
+  const entries=Object.entries(emoStats);
+  if(!entries.length){area.innerHTML='<div style="color:var(--text3);font-size:13px">Belum ada data.</div>';return;}
+  const sorted=[...entries].sort((a,b)=>b[1].wins/b[1].total-a[1].wins/a[1].total);
+  area.innerHTML=sorted.map(([emo,st])=>{
+    const pct=Math.round(st.wins/st.total*100);
+    const color=pct>=65?'var(--green)':pct>=40?'var(--amber)':'var(--red)';
+    return `<div class="bar-row"><div class="bar-name">${emo}</div><div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${color}"></div></div><div class="bar-pct">${pct}%</div></div>`;
+  }).join('');
+}
+
+function renderRecentTrades() {
+  const el=$('recent-trades');
+  if(!trades.length){el.innerHTML='';return;}
+  el.innerHTML=[...trades].slice(0,5).map(t=>tradeRowHTML(t)).join('');
+}
+
+// ════════════════════════════════════════════════
+//  TRADE ROW & DETAIL
+// ════════════════════════════════════════════════
+function tradeRowHTML(t) {
+  const resColor=t.result==='win'?'var(--green)':t.result==='loss'?'var(--red)':'var(--amber)';
+  const resLabel=t.result==='win'?'WIN':t.result==='loss'?'LOSS':t.result==='be'?'BE':'—';
+  return `<div class="trade-row" onclick="openDetail('${t.id}')">
+    <div class="trade-pair">${t.pair||'—'}</div>
+    <div class="trade-date">${fmtDate(t.date)}</div>
+    <div class="trade-reason">${t.reason||'—'}</div>
+    <div class="emo-tag" style="${emoTagStyle(t.emoBefore)}">${t.emoBefore||'—'}</div>
+    <div class="trade-result" style="color:${resColor};font-family:Space Mono,monospace;font-size:12px;font-weight:700;min-width:36px;text-align:center">${resLabel}</div>
+    <div class="trade-grade">${t.grade||'—'}</div>
+  </div>`;
+}
+
+function emoTagStyle(emo) {
+  const map={'Confident':'background:rgba(74,222,128,.12);color:#4ADE80','FOMO':'background:rgba(248,113,113,.12);color:#F87171','Tenang':'background:rgba(123,104,238,.12);color:#7B68EE','Ngantuk':'background:rgba(251,191,36,.12);color:#FBBF24','Greed':'background:rgba(248,113,113,.12);color:#F87171','Stres':'background:rgba(248,113,113,.12);color:#F87171','Happy':'background:rgba(74,222,128,.12);color:#4ADE80','Fokus':'background:rgba(96,165,250,.12);color:#60A5FA','Ragu':'background:rgba(251,191,36,.12);color:#FBBF24'};
+  return map[emo]||'background:rgba(90,90,114,.2);color:#9090A8';
+}
+
+function fmtDate(d) {
+  if(!d) return '—';
+  try{return new Date(d+'T00:00:00').toLocaleDateString('id-ID',{day:'2-digit',month:'short',year:'numeric'});}catch(e){return d;}
+}
+
+window.openDetail = (id) => {
+  const t=trades.find(x=>x.id===id);
+  if(!t) return;
+  const resLabel=t.result==='win'?'✅ Win / TP Hit':t.result==='loss'?'❌ Loss / SL Hit':'〰️ Break Even';
+  $('detail-title').textContent=`${t.pair} — ${fmtDate(t.date)}`;
+  $('detail-body').innerHTML=`
+    <div class="detail-row"><div class="detail-label">Reason Entry</div><div class="detail-val">${t.reason||'—'}</div></div>
+    <div class="detail-row"><div class="detail-label">Emosi Sebelum</div><div class="detail-val"><span class="emo-tag" style="${emoTagStyle(t.emoBefore)}">${t.emoBefore||'—'}</span>${t.emoBeforeDesc?`<div style="color:var(--text2);font-size:13px;margin-top:6px">${t.emoBeforeDesc}</div>`:''}</div></div>
+    <div class="detail-row"><div class="detail-label">Hasil</div><div class="detail-val">${resLabel}</div></div>
+    <div class="detail-row"><div class="detail-label">Emosi Sesudah</div><div class="detail-val"><span class="emo-tag" style="${emoTagStyle(t.emoAfter)}">${t.emoAfter||'—'}</span>${t.emoAfterDesc?`<div style="color:var(--text2);font-size:13px;margin-top:6px">${t.emoAfterDesc}</div>`:''}</div></div>
+    <div class="detail-row"><div class="detail-label">Pelajaran</div><div class="detail-val" style="color:var(--accent)">${t.lesson||'—'}</div></div>
+    <div class="detail-row"><div class="detail-label">Grade</div><div class="detail-val"><span style="font-family:Space Mono,monospace;font-size:22px;font-weight:700;color:var(--amber)">${t.grade||'—'}</span><span style="color:var(--text3)">/5</span></div></div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button class="btn-edit" onclick="editTrade('${t.id}')">✏️ Edit</button>
+      <button class="btn-del" onclick="deleteTrade('${t.id}')">🗑 Hapus</button>
+    </div>
+  `;
+  $('modal-detail').classList.add('open');
+};
+
+// ════════════════════════════════════════════════
+//  JOURNAL FORM
+// ════════════════════════════════════════════════
+function initForm() {
+  if (!editingTradeId) {
+    setVal('f-date', new Date().toISOString().split('T')[0]);
+    setVal('f-pair',''); setVal('f-reason','');
+    setVal('f-emo-before-desc',''); setVal('f-emo-after-desc',''); setVal('f-lesson','');
+    selEmoBefore=selEmoAfter=selResult=selGrade=null;
+    ['win','loss','be'].forEach(r=>$('btn-'+r).className='result-btn');
+    $$('.grade-btn').forEach(b=>b.classList.remove('selected'));
+    $('form-title').textContent='Jurnal Trade Baru';
+    $('btn-submit').textContent='SIMPAN JURNAL →';
+  }
+  renderEmoPicker('emo-before-picker','before');
+  renderEmoPicker('emo-after-picker','after');
+}
+
+function resetForm() {
+  editingTradeId=null;
+  setVal('f-date', new Date().toISOString().split('T')[0]);
+  setVal('f-pair',''); setVal('f-reason','');
+  setVal('f-emo-before-desc',''); setVal('f-emo-after-desc',''); setVal('f-lesson','');
+  selEmoBefore=selEmoAfter=selResult=selGrade=null;
+  ['win','loss','be'].forEach(r=>$('btn-'+r).className='result-btn');
+  $$('.grade-btn').forEach(b=>b.classList.remove('selected'));
+  renderEmoPicker('emo-before-picker','before');
+  renderEmoPicker('emo-after-picker','after');
+  $('form-title').textContent='Jurnal Trade Baru';
+  $('btn-submit').textContent='SIMPAN JURNAL →';
+}
+
+function renderEmoPicker(containerId, target) {
+  const c=$(containerId);
+  const sel=target==='before'?selEmoBefore:selEmoAfter;
+  c.innerHTML=emotions.map(e=>`<button class="emo-btn${e===sel?' selected':''}" onclick="pickEmo('${e}','${target}')">${e}</button>`).join('')
+    +`<button class="emo-btn add-new" onclick="openEmoModal('${target}')">+ Tambah</button>`;
+}
+
+window.pickEmo = (emo, target) => {
+  if(target==='before') selEmoBefore=(selEmoBefore===emo?null:emo);
+  else selEmoAfter=(selEmoAfter===emo?null:emo);
+  renderEmoPicker(target==='before'?'emo-before-picker':'emo-after-picker', target);
+};
+
+window.selectResult = (r) => {
+  selResult=(selResult===r?null:r);
+  ['win','loss','be'].forEach(x=>$('btn-'+x).className='result-btn');
+  if(selResult) $('btn-'+selResult).classList.add('sel-'+selResult);
+};
+
+window.selectGrade = (g) => {
+  selGrade=(selGrade===g?null:g);
+  $$('.grade-btn').forEach((b,i)=>b.classList.toggle('selected',i+1===selGrade));
+};
+
+// ════════════════════════════════════════════════
+//  HISTORY
+// ════════════════════════════════════════════════
+function renderHistory() {
+  const q    = $('search-input')?.value.toLowerCase()||'';
+  const fRes = $('filter-result')?.value||'';
+  const el   = $('history-list');
+  let filtered=[...trades];
+  if(q) filtered=filtered.filter(t=>(t.pair+t.reason+(t.emoBefore||'')+(t.lesson||'')).toLowerCase().includes(q));
+  if(fRes) filtered=filtered.filter(t=>t.result===fRes);
+  if(!filtered.length){
+    el.innerHTML='<div class="empty-state"><div class="empty-icon">🔍</div><p>Tidak ada trade yang cocok.</p></div>';
+    return;
+  }
+  el.innerHTML=filtered.map(t=>tradeRowHTML(t)).join('');
+}
+window.filterHistory=()=>renderHistory();
+
+// ════════════════════════════════════════════════
+//  ANALYTICS
+// ════════════════════════════════════════════════
+function renderAnalytics() {
+  if(trades.length<3){
+    $('analytics-empty').style.display='block';
+    $('analytics-content').style.display='none';
+    return;
+  }
+  $('analytics-empty').style.display='none';
+  $('analytics-content').style.display='block';
+  Object.values(chartInstances).forEach(c=>c.destroy());
+  chartInstances={};
+
+  const emoStats=calcEmoStats();
+  const entries=Object.entries(emoStats);
+  const tick={color:'#9090A8',font:{size:11}};
+  const grid={color:'rgba(255,255,255,0.05)'};
+
+  if(entries.length){
+    chartInstances.c1=new Chart($('chart-emo-dist'),{type:'doughnut',data:{labels:entries.map(e=>e[0]),datasets:[{data:entries.map(e=>e[1].total),backgroundColor:COLORS,borderWidth:0}]},options:{responsive:true,plugins:{legend:{labels:{color:'#9090A8',font:{size:11},boxWidth:12,padding:10}}}}});
+    const sorted=[...entries].sort((a,b)=>b[1].wins/b[1].total-a[1].wins/a[1].total);
+    chartInstances.c2=new Chart($('chart-emo-wr'),{type:'bar',data:{labels:sorted.map(e=>e[0]),datasets:[{data:sorted.map(e=>Math.round(e[1].wins/e[1].total*100)),backgroundColor:sorted.map(e=>{const w=e[1].wins/e[1].total;return w>=.6?'#4ADE80':w>=.4?'#FBBF24':'#F87171';}),borderRadius:6}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:tick,grid},y:{ticks:{...tick,callback:v=>v+'%'},grid,max:100}}}});
+  }
+
+  const gradeDist=[1,2,3,4,5].map(g=>trades.filter(t=>t.grade===g).length);
+  chartInstances.c3=new Chart($('chart-grades'),{type:'bar',data:{labels:['G1','G2','G3','G4','G5'],datasets:[{data:gradeDist,backgroundColor:['#F87171','#F87171','#FBBF24','#4ADE80','#4ADE80'],borderRadius:6}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:tick,grid},y:{ticks:tick,grid}}}});
+
+  const afterMap={};
+  trades.forEach(t=>{if(!t.emoAfter||!t.grade)return;if(!afterMap[t.emoAfter])afterMap[t.emoAfter]={sum:0,count:0};afterMap[t.emoAfter].sum+=t.grade;afterMap[t.emoAfter].count++;});
+  const ae=Object.entries(afterMap);
+  if(ae.length) chartInstances.c4=new Chart($('chart-after-grade'),{type:'bar',data:{labels:ae.map(e=>e[0]),datasets:[{data:ae.map(e=>parseFloat((e[1].sum/e[1].count).toFixed(1))),backgroundColor:COLORS,borderRadius:6}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:tick,grid},y:{ticks:tick,grid,min:0,max:5}}}});
+}
+
+// ════════════════════════════════════════════════
+//  MODALS
+// ════════════════════════════════════════════════
+window.openModal = id => { $(id)?.classList.add('open'); };
+window.closeModal = id => { $(id)?.classList.remove('open'); };
+
+window.openEmoModal = (target) => {
+  emoModalTarget=target;
+  $('modal-emo').classList.add('open');
+  setTimeout(()=>$('new-emo-input')?.focus(),80);
+};
+
+window.addEmotion = async () => {
+  const val2=$('new-emo-input').value.trim();
+  if(!val2) return;
+  const cap=val2.charAt(0).toUpperCase()+val2.slice(1);
+  if(!emotions.includes(cap)){
+    emotions.push(cap);
+    await saveUserEmotions();
+  }
+  closeModal('modal-emo');
+  $('new-emo-input').value='';
+  renderEmoPicker('emo-before-picker','before');
+  renderEmoPicker('emo-after-picker','after');
+  window.pickEmo(cap, emoModalTarget);
+};
+
+// ════════════════════════════════════════════════
+//  TOAST
+// ════════════════════════════════════════════════
+function showToast(msg,type='success') {
+  const el=$('toast');
+  el.textContent=msg; el.className='show '+type;
+  clearTimeout(el._t);
+  el._t=setTimeout(()=>el.className='',2800);
+}
+window.showToast=showToast;
+
+// ════════════════════════════════════════════════
+//  CUSTOM CONFIRM MODAL
+// ════════════════════════════════════════════════
+let confirmCallback = null;
+
+window.showConfirm = ({ icon='⚠️', title, message, confirmText='OK', danger=false, onConfirm }) => {
+  confirmCallback = onConfirm;
+  $('confirm-icon').textContent  = icon;
+  $('confirm-title').textContent = title;
+  $('confirm-msg').innerHTML     = message;
+  $('confirm-ok-btn').textContent   = confirmText;
+  $('confirm-ok-btn').className     = 'btn-confirm-ok ' + (danger ? 'danger' : 'normal');
+  $('confirm-overlay').classList.add('open');
+};
+
+window.closeConfirm = () => {
+  $('confirm-overlay').classList.remove('open');
+  confirmCallback = null;
+};
+
+window.triggerConfirm = async () => {
+  if (confirmCallback) await confirmCallback();
+  window.closeConfirm();
+};
+
+// ════════════════════════════════════════════════
+//  PROFILE PANEL
+// ════════════════════════════════════════════════
+window.toggleProfilePanel = () => {
+  const panel    = $('profile-panel');
+  const isOpen   = panel.classList.contains('open');
+  if (isOpen) { closeProfilePanel(); return; }
+  const name     = currentUser?.displayName || '';
+  const email    = currentUser?.email || '';
+  const initials = (name||email).slice(0,2).toUpperCase();
+  $('panel-avatar-initials').textContent = initials;
+  $('panel-user-name').textContent       = name || 'Trader';
+  $('panel-user-email').textContent      = email;
+  $('panel-name-input').value            = name;
+  // photo
+  const photoURL = currentUser?.photoURL;
+  const bigAvatar = $('panel-avatar-big');
+  let existingImg = bigAvatar.querySelector('img');
+  if (photoURL) {
+    if (!existingImg) {
+      const img = document.createElement('img');
+      img.src = photoURL;
+      bigAvatar.insertBefore(img, bigAvatar.firstChild);
+    } else { existingImg.src = photoURL; }
+  }
+  panel.classList.add('open');
+  $('panel-backdrop').classList.add('open');
+  $('avatar-btn').classList.add('avatar-btn-active');
+};
+
+window.closeProfilePanel = () => {
+  $('profile-panel').classList.remove('open');
+  $('panel-backdrop').classList.remove('open');
+  $('avatar-btn')?.classList.remove('avatar-btn-active');
+};
+
+window.saveProfile = async () => {
+  const newName = $('panel-name-input').value.trim();
+  if (!newName) { showToast('Nama tidak boleh kosong!', 'error'); return; }
+  const btn = document.querySelector('.btn-save-profile');
+  try {
+    btn.textContent='Menyimpan...'; btn.disabled=true;
+    await updateProfile(auth.currentUser, { displayName: newName });
+    // Sync local state
+    currentUser = auth.currentUser;
+    const initials = newName.slice(0,2).toUpperCase();
+    // Update panel
+    $('panel-user-name').textContent = newName;
+    $('panel-avatar-initials').textContent = initials;
+    // Update topbar avatar — only update text if no photo
+    const avatarBtn = $('avatar-btn');
+    if (!avatarBtn.querySelector('img')) {
+      avatarBtn.textContent = initials;
+    }
+    avatarBtn.title = newName + ' — klik untuk profil';
+    showToast('Nama berhasil diperbarui!', 'success');
+  } catch(e) {
+    showToast('Gagal simpan: ' + e.message, 'error');
+  }
+  btn.textContent='Simpan Perubahan'; btn.disabled=false;
+};
+
+window.handleAvatarUpload = async (input) => {
+  const file = input.files[0];
+  if (!file) return;
+  if (file.size > 2*1024*1024) { showToast('Foto maksimal 2MB!','error'); return; }
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    const dataUrl = e.target.result;
+    try {
+      await updateProfile(auth.currentUser, { photoURL: dataUrl });
+      const bigAvatar = $('panel-avatar-big');
+      let img = bigAvatar.querySelector('img');
+      if (!img) { img = document.createElement('img'); bigAvatar.insertBefore(img, bigAvatar.firstChild); }
+      img.src = dataUrl;
+      $('avatar-btn').innerHTML = `<img src="${dataUrl}" style="width:100%;height:100%;object-fit:cover;border-radius:50%">`;
+      showToast('Foto profil diperbarui!', 'success');
+    } catch(er) { showToast('Gagal update foto.', 'error'); }
+  };
+  reader.readAsDataURL(file);
+};
+
+// keyboard
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    window.closeConfirm();
+    window.closeProfilePanel();
+    closeModal('modal-emo');
+    closeModal('modal-detail');
+    closeModal('modal-new-acct');
+  }
+  if (e.key === 'Enter' && $('modal-emo')?.classList.contains('open')) window.addEmotion();
+});
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0A0A0F;--bg2:#111118;--bg3:#18181F;--bg4:#1E1E28;
+  --border:#2A2A3A;--border2:#3A3A50;
+  --text:#F0F0F8;--text2:#9090A8;--text3:#5A5A72;
+  --accent:#7B68EE;--accent2:#5B48CE;--accent-glow:rgba(123,104,238,0.15);
+  --green:#4ADE80;--red:#F87171;--amber:#FBBF24;
+  --green-bg:rgba(74,222,128,0.1);--red-bg:rgba(248,113,113,0.1);
+  --r:10px;--rl:16px;
+}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:15px;line-height:1.5}
+button,input,textarea,select{font-family:'DM Sans',sans-serif}
+
+/* ── AUTH ── */
+#auth-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:2rem;background:var(--bg)}
+.auth-logo{font-family:'Space Mono',monospace;font-size:28px;font-weight:700;letter-spacing:-1px;margin-bottom:6px;text-align:center}
+.auth-logo span{color:var(--accent)}
+.auth-tagline{color:var(--text2);font-size:14px;margin-bottom:32px;text-align:center;max-width:360px}
+.auth-card{background:var(--bg3);border:1px solid var(--border);border-radius:var(--rl);padding:32px;width:100%;max-width:400px}
+.auth-tabs{display:flex;border-bottom:1px solid var(--border);margin-bottom:24px}
+.auth-tab{flex:1;padding:10px;text-align:center;font-size:14px;cursor:pointer;color:var(--text2);border:none;background:transparent;border-bottom:2px solid transparent;margin-bottom:-1px;transition:.2s;font-weight:500}
+.auth-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.auth-field{margin-bottom:15px}
+.auth-field label{display:block;font-size:11px;color:var(--text2);margin-bottom:7px;text-transform:uppercase;letter-spacing:.8px;font-weight:600}
+.auth-field input{width:100%;background:var(--bg4);border:1px solid var(--border);border-radius:var(--r);padding:11px 14px;color:var(--text);font-size:14px;outline:none;transition:.2s}
+.auth-field input:focus{border-color:var(--accent)}
+.btn-primary{width:100%;background:var(--accent);color:#fff;border:none;border-radius:var(--r);padding:12px;font-size:14px;font-weight:600;transition:.15s;cursor:pointer}
+.btn-primary:hover{background:var(--accent2)}
+.btn-primary:active{transform:scale(.98)}
+.or-sep{display:flex;align-items:center;gap:12px;margin:16px 0;color:var(--text3);font-size:12px}
+.or-sep::before,.or-sep::after{content:'';flex:1;height:1px;background:var(--border)}
+.btn-google{width:100%;background:var(--bg4);border:1px solid var(--border2);border-radius:var(--r);padding:11px;color:var(--text);display:flex;align-items:center;justify-content:center;gap:10px;cursor:pointer;font-size:14px;transition:.15s}
+.btn-google:hover{border-color:var(--accent)}
+.btn-google:active{transform:scale(.98)}
+.g-icon{width:18px;height:18px;border-radius:50%;background:conic-gradient(#4285F4 0 25%,#34A853 25% 50%,#FBBC05 50% 75%,#EA4335 75%);flex-shrink:0}
+.auth-note{font-size:12px;color:var(--text3);text-align:center;margin-top:16px;line-height:1.6}
+
+/* ── APP ── */
+#app{display:none;flex-direction:column;min-height:100vh}
+.topbar{display:flex;align-items:center;padding:0 20px;height:54px;background:var(--bg2);border-bottom:1px solid var(--border);gap:2px;position:sticky;top:0;z-index:100;flex-wrap:wrap}
+.topbar-logo{font-family:'Space Mono',monospace;font-size:14px;font-weight:700;color:var(--accent);margin-right:8px;white-space:nowrap}
+.topbar-logo span{color:var(--text)}
+.topbar-acct{font-size:12px;color:var(--text3);margin-right:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
+.topbar-acct strong{color:var(--text2)}
+.nav-btn{padding:6px 13px;border-radius:var(--r);font-size:13px;cursor:pointer;border:none;transition:.15s;background:transparent;color:var(--text2);font-weight:500;white-space:nowrap}
+.nav-btn:hover{background:var(--bg4);color:var(--text)}
+.nav-btn.active{background:var(--accent-glow);color:var(--accent)}
+.avatar-btn{width:30px;height:30px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;cursor:pointer;margin-left:8px;flex-shrink:0;border:none;color:#fff}
+.avatar-btn:hover{background:var(--accent2)}
+
+.content{flex:1;padding:24px 20px;max-width:960px;margin:0 auto;width:100%}
+.page{display:none}.page.active{display:block}
+.page-header{margin-bottom:22px}
+.page-header h2{font-size:21px;font-weight:600;margin-bottom:3px}
+.page-header p{font-size:13px;color:var(--text3)}
+
+/* ── STATS ── */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}
+.stat-card{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:16px}
+.stat-label{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px;font-weight:600}
+.stat-val{font-size:24px;font-weight:700;font-family:'Space Mono',monospace}
+.stat-val.green{color:var(--green)}.stat-val.accent{color:var(--accent)}.stat-val.amber{color:var(--amber)}
+.stat-sub{font-size:11px;color:var(--text3);margin-top:4px}
+
+/* ── CHARTS ── */
+.charts-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:22px}
+.chart-card{background:var(--bg3);border:1px solid var(--border);border-radius:var(--rl);padding:18px}
+.chart-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--text3);margin-bottom:14px}
+.donut-wrap{display:flex;align-items:center;gap:18px}
+.donut-legend{display:flex;flex-direction:column;gap:9px;flex:1}
+.legend-row{display:flex;align-items:center;gap:8px;font-size:12px}
+.legend-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.legend-label{color:var(--text2);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.legend-val{font-family:'Space Mono',monospace;font-size:11px;color:var(--text);flex-shrink:0}
+.bar-chart{display:flex;flex-direction:column;gap:9px}
+.bar-row{display:flex;align-items:center;gap:10px}
+.bar-name{font-size:12px;color:var(--text2);width:70px;text-align:right;flex-shrink:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar-track{flex:1;height:7px;background:var(--bg4);border-radius:4px;overflow:hidden}
+.bar-fill{height:100%;border-radius:4px;transition:.5s}
+.bar-pct{font-size:11px;font-family:'Space Mono',monospace;color:var(--text2);width:30px;flex-shrink:0}
+
+/* ── TRADES ── */
+.section-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--text3);margin-bottom:10px}
+.trades-list{display:flex;flex-direction:column;gap:7px}
+.trade-row{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:12px 15px;display:flex;align-items:center;gap:10px;cursor:pointer;transition:.15s}
+.trade-row:hover{border-color:var(--border2);background:var(--bg4)}
+.trade-pair{font-family:'Space Mono',monospace;font-size:13px;font-weight:700;min-width:52px;flex-shrink:0}
+.trade-date{font-size:12px;color:var(--text3);flex-shrink:0}
+.trade-reason{font-size:13px;color:var(--text2);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.emo-tag{font-size:11px;padding:3px 9px;border-radius:20px;font-weight:600;flex-shrink:0;white-space:nowrap}
+.trade-grade{width:26px;height:26px;border-radius:6px;background:var(--bg4);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;font-family:'Space Mono',monospace;color:var(--accent);flex-shrink:0;border:1px solid var(--border)}
+.empty-state{text-align:center;padding:52px 20px;color:var(--text3)}
+.empty-icon{font-size:34px;margin-bottom:12px;opacity:.5}
+.empty-state p{font-size:14px;line-height:1.7}
+
+/* ── ACCOUNTS PAGE ── */
+.acct-card{background:var(--bg3);border:1px solid var(--border);border-radius:var(--rl);padding:18px 20px;display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;transition:.15s}
+.acct-card:hover{border-color:var(--border2)}
+.acct-card.active-acct{border-color:var(--accent);background:var(--accent-glow)}
+.acct-card-left{display:flex;align-items:center;gap:14px;cursor:pointer;flex:1;min-width:0}
+.acct-icon{width:42px;height:42px;border-radius:10px;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0;color:#fff;font-family:'Space Mono',monospace}
+.acct-name{font-size:15px;font-weight:600}
+.acct-desc{font-size:12px;color:var(--text3);margin-top:2px}
+.badge-active{font-size:11px;padding:3px 10px;border-radius:20px;background:var(--accent-glow);color:var(--accent);font-weight:600;border:1px solid var(--accent);white-space:nowrap}
+.btn-icon-danger{background:transparent;border:none;color:var(--text3);font-size:16px;cursor:pointer;padding:4px 6px;border-radius:6px;transition:.15s}
+.btn-icon-danger:hover{background:var(--red-bg);color:var(--red)}
+.btn-new-acct{display:flex;align-items:center;gap:8px;padding:12px 18px;border-radius:var(--r);background:var(--accent-glow);border:1px dashed var(--accent);color:var(--accent);cursor:pointer;font-size:14px;font-weight:600;width:100%;justify-content:center;transition:.15s;margin-top:4px}
+.btn-new-acct:hover{background:var(--accent);color:#fff}
+
+/* ── JOURNAL FORM ── */
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
+.form-field{margin-bottom:16px}
+.form-field label{display:block;font-size:11px;color:var(--text2);margin-bottom:7px;text-transform:uppercase;letter-spacing:.8px;font-weight:600}
+.req{color:var(--accent)}
+.form-field input,.form-field textarea,.form-field select{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:10px 13px;color:var(--text);font-size:14px;outline:none;transition:.2s;resize:vertical}
+.form-field textarea{min-height:78px}
+.form-field input:focus,.form-field textarea:focus,.form-field select:focus{border-color:var(--accent)}
+.form-sep{border:none;border-top:1px solid var(--border);margin:6px 0 20px}
+.form-section-lbl{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--accent);margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.form-section-lbl::after{content:'';flex:1;height:1px;background:var(--accent-glow)}
+
+.emotion-picker{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:10px}
+.emo-btn{padding:5px 13px;border-radius:20px;font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--border);background:var(--bg3);color:var(--text2);transition:.15s}
+.emo-btn:hover{border-color:var(--border2);color:var(--text)}
+.emo-btn.selected{border-color:var(--accent);background:var(--accent-glow);color:var(--accent)}
+.emo-btn.add-new{border-style:dashed;color:var(--text3)}
+.emo-btn.add-new:hover{color:var(--accent);border-color:var(--accent)}
+
+.result-toggle{display:flex;gap:8px;flex-wrap:wrap}
+.result-btn{padding:9px 18px;border-radius:var(--r);border:1px solid var(--border);background:var(--bg3);color:var(--text2);font-size:13px;font-weight:600;cursor:pointer;transition:.15s}
+.result-btn:hover{border-color:var(--border2)}
+.sel-win{border-color:var(--green)!important;background:var(--green-bg)!important;color:var(--green)!important}
+.sel-loss{border-color:var(--red)!important;background:var(--red-bg)!important;color:var(--red)!important}
+.sel-be{border-color:var(--amber)!important;background:rgba(251,191,36,.1)!important;color:var(--amber)!important}
+
+.grade-picker{display:flex;gap:8px}
+.grade-btn{width:40px;height:40px;border-radius:8px;border:1px solid var(--border);background:var(--bg3);color:var(--text2);font-size:15px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:.15s;font-family:'Space Mono',monospace}
+.grade-btn:hover{border-color:var(--accent);color:var(--accent)}
+.grade-btn.selected{background:var(--accent);color:#fff;border-color:var(--accent)}
+.grade-hint{font-size:11px;color:var(--text3);margin-top:6px}
+
+.submit-btn{width:100%;background:var(--accent);color:#fff;border:none;border-radius:var(--r);padding:13px;font-family:'Space Mono',monospace;font-size:14px;font-weight:700;letter-spacing:.5px;cursor:pointer;transition:.15s;margin-top:6px}
+.submit-btn:hover{background:var(--accent2);transform:translateY(-1px)}
+.submit-btn:active{transform:none}
+
+/* ── HISTORY ── */
+.history-hdr{display:flex;align-items:center;gap:10px;margin-bottom:18px;flex-wrap:wrap}
+.history-hdr h2{font-size:21px;font-weight:600;margin-right:auto}
+.search-inp{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:9px 13px;color:var(--text);font-size:13px;outline:none;width:210px;transition:.2s}
+.search-inp:focus{border-color:var(--accent)}
+.filter-sel{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:9px 12px;color:var(--text);font-size:13px;outline:none;cursor:pointer}
+
+/* ── ANALYTICS ── */
+.analytics-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}
+
+/* ── DETAIL MODAL ── */
+.detail-row{display:flex;flex-direction:column;gap:4px;padding:13px 0;border-bottom:1px solid var(--border)}
+.detail-row:last-child{border-bottom:none}
+.detail-label{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;font-weight:600}
+.detail-val{font-size:14px;color:var(--text);line-height:1.5}
+.btn-edit{flex:1;padding:10px;border-radius:var(--r);background:var(--accent-glow);border:1px solid var(--accent);color:var(--accent);font-size:13px;font-weight:600;cursor:pointer;transition:.15s}
+.btn-edit:hover{background:var(--accent);color:#fff}
+.btn-del{flex:1;padding:10px;border-radius:var(--r);background:var(--red-bg);border:1px solid var(--red);color:var(--red);font-size:13px;font-weight:600;cursor:pointer;transition:.15s}
+.btn-del:hover{background:var(--red);color:#fff}
+
+/* ── MODAL ── */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:500;align-items:center;justify-content:center;padding:20px}
+.modal-overlay.open{display:flex}
+.modal-box{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--rl);padding:26px;max-width:460px;width:100%;max-height:90vh;overflow-y:auto}
+.modal-box h3{font-size:17px;font-weight:600;margin-bottom:5px}
+.modal-box p{font-size:13px;color:var(--text2);margin-bottom:18px}
+.modal-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.modal-hdr h3{font-size:17px;font-weight:600;margin:0}
+.btn-close{background:transparent;border:none;color:var(--text2);font-size:20px;cursor:pointer;padding:2px 6px;line-height:1;border-radius:6px}
+.btn-close:hover{color:var(--text);background:var(--bg4)}
+.modal-inp{width:100%;background:var(--bg4);border:1px solid var(--border);border-radius:var(--r);padding:11px 13px;color:var(--text);font-size:14px;outline:none;margin-bottom:12px}
+.modal-inp:focus{border-color:var(--accent)}
+.modal-inp textarea{resize:vertical;min-height:70px}
+.modal-btns{display:flex;gap:10px;justify-content:flex-end;margin-top:4px}
+.btn-cancel{padding:9px 18px;border:1px solid var(--border);border-radius:var(--r);background:transparent;color:var(--text2);font-size:13px;cursor:pointer;transition:.15s}
+.btn-cancel:hover{border-color:var(--border2);color:var(--text)}
+.btn-confirm{padding:9px 18px;border-radius:var(--r);background:var(--accent);color:#fff;border:none;font-size:13px;font-weight:600;cursor:pointer;transition:.15s}
+.btn-confirm:hover{background:var(--accent2)}
+
+/* ── LOADING OVERLAY ── */
+#loading-overlay{display:none;position:fixed;inset:0;background:rgba(10,10,15,.85);z-index:999;align-items:center;justify-content:center;flex-direction:column;gap:14px}
+.spinner{width:36px;height:36px;border:3px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loading-text{font-size:13px;color:var(--text2)}
+
+/* ── TOAST ── */
+#toast{position:fixed;bottom:26px;right:26px;padding:12px 20px;border-radius:var(--r);font-size:13px;font-weight:600;transition:.3s;z-index:9999;opacity:0;transform:translateY(16px);pointer-events:none}
+#toast.show{opacity:1;transform:translateY(0)}
+#toast.success{background:var(--green);color:#041A08}
+#toast.error{background:var(--red);color:#1A0404}
+
+/* ── CUSTOM CONFIRM MODAL ── */
+#confirm-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:800;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px)}
+#confirm-overlay.open{display:flex;animation:fadeIn .15s ease}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.confirm-box{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--rl);padding:28px;max-width:380px;width:100%;text-align:center;animation:slideUp .2s ease}
+@keyframes slideUp{from{transform:translateY(16px);opacity:0}to{transform:translateY(0);opacity:1}}
+.confirm-icon{font-size:36px;margin-bottom:12px;line-height:1}
+.confirm-title{font-size:17px;font-weight:700;margin-bottom:8px}
+.confirm-msg{font-size:13px;color:var(--text2);line-height:1.6;margin-bottom:24px}
+.confirm-msg strong{color:var(--text)}
+.confirm-btns{display:flex;gap:10px;justify-content:center}
+.btn-confirm-cancel{padding:10px 24px;border:1px solid var(--border2);border-radius:var(--r);background:var(--bg4);color:var(--text2);font-size:14px;font-weight:500;cursor:pointer;transition:.15s;font-family:'DM Sans',sans-serif}
+.btn-confirm-cancel:hover{border-color:var(--border2);color:var(--text)}
+.btn-confirm-ok{padding:10px 24px;border-radius:var(--r);border:none;font-size:14px;font-weight:700;cursor:pointer;transition:.15s;font-family:'DM Sans',sans-serif}
+.btn-confirm-ok.danger{background:var(--red);color:#fff}
+.btn-confirm-ok.danger:hover{background:#ef4444}
+.btn-confirm-ok.normal{background:var(--accent);color:#fff}
+.btn-confirm-ok.normal:hover{background:var(--accent2)}
+
+/* ── PROFILE PANEL ── */
+#profile-panel{position:fixed;top:0;right:-340px;width:320px;height:100vh;background:var(--bg2);border-left:1px solid var(--border);z-index:600;transition:.3s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column;overflow:hidden}
+#profile-panel.open{right:0;box-shadow:-20px 0 60px rgba(0,0,0,.5)}
+#panel-backdrop{display:none;position:fixed;inset:0;z-index:590;background:rgba(0,0,0,.4);backdrop-filter:blur(2px)}
+#panel-backdrop.open{display:block}
+.panel-header{padding:20px 20px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.panel-header h3{font-size:15px;font-weight:600}
+.panel-close{background:transparent;border:none;color:var(--text2);font-size:20px;cursor:pointer;padding:4px;border-radius:6px;line-height:1;display:flex;align-items:center;justify-content:center}
+.panel-close:hover{background:var(--bg4);color:var(--text)}
+.panel-body{flex:1;overflow-y:auto;padding:20px}
+.panel-avatar-section{display:flex;flex-direction:column;align-items:center;gap:12px;padding-bottom:20px;border-bottom:1px solid var(--border);margin-bottom:20px}
+.panel-avatar-big{width:72px;height:72px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700;color:#fff;font-family:'Space Mono',monospace;position:relative;cursor:pointer;overflow:hidden;border:3px solid var(--border2);transition:.2s}
+.panel-avatar-big:hover .avatar-overlay{opacity:1}
+.panel-avatar-big img{width:100%;height:100%;object-fit:cover;border-radius:50%}
+.avatar-overlay{position:absolute;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;font-weight:600;opacity:0;transition:.2s;border-radius:50%;flex-direction:column;gap:2px}
+.panel-user-name{font-size:16px;font-weight:700;text-align:center}
+.panel-user-email{font-size:12px;color:var(--text3);text-align:center}
+.panel-section-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--text3);margin-bottom:10px}
+.panel-field{margin-bottom:14px}
+.panel-field label{display:block;font-size:11px;color:var(--text2);margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.panel-field input{width:100%;background:var(--bg4);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;color:var(--text);font-size:14px;outline:none;transition:.2s;font-family:'DM Sans',sans-serif}
+.panel-field input:focus{border-color:var(--accent)}
+.btn-save-profile{width:100%;background:var(--accent);color:#fff;border:none;border-radius:var(--r);padding:11px;font-size:14px;font-weight:600;cursor:pointer;transition:.15s;font-family:'DM Sans',sans-serif;margin-top:4px}
+.btn-save-profile:hover{background:var(--accent2)}
+.panel-divider{border:none;border-top:1px solid var(--border);margin:20px 0}
+.panel-menu-item{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:var(--r);cursor:pointer;transition:.15s;font-size:14px;font-weight:500;color:var(--text2);border:none;background:transparent;width:100%;text-align:left;font-family:'DM Sans',sans-serif}
+.panel-menu-item:hover{background:var(--bg4);color:var(--text)}
+.panel-menu-item .menu-icon{font-size:18px;width:24px;text-align:center}
+.panel-menu-item.danger{color:var(--red)}
+.panel-menu-item.danger:hover{background:var(--red-bg)}
+.panel-footer{padding:16px 20px;border-top:1px solid var(--border)}
+.avatar-btn-active{box-shadow:0 0 0 2px var(--accent)!important}
+
+
+</style>
+</head>
+<body>
+
+<!-- ════ LOADING ════ -->
+<div id="loading-overlay" style="display:flex">
+  <div class="spinner"></div>
+  <div class="loading-text">Memuat aplikasi...</div>
+</div>
+
+<!-- ════ AUTH ════ -->
+<div id="auth-screen" style="display:none">
+  <div class="auth-logo">lazy<span>trader</span><span style="color:var(--text2);font-weight:400">.journal</span></div>
+  <div class="auth-tagline">Jurnal trading yang gak bikin males 🧠<br>by Lazy Trader Community</div>
+  <div class="auth-card">
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="tab-login" onclick="
+        this.classList.add('active');
+        document.getElementById('tab-reg').classList.remove('active');
+        document.getElementById('form-login').style.display='block';
+        document.getElementById('form-reg').style.display='none';
+      ">Masuk</button>
+      <button class="auth-tab" id="tab-reg" onclick="
+        this.classList.add('active');
+        document.getElementById('tab-login').classList.remove('active');
+        document.getElementById('form-login').style.display='none';
+        document.getElementById('form-reg').style.display='block';
+      ">Daftar</button>
+    </div>
+
+    <!-- LOGIN -->
+    <div id="form-login">
+      <div class="auth-field"><label>Email</label><input type="email" id="l-email" placeholder="email@kamu.com" autocomplete="email"></div>
+      <div class="auth-field"><label>Password</label><input type="password" id="l-pass" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter')doEmailLogin()"></div>
+      <button class="btn-primary" id="btn-email-login" onclick="doEmailLogin()">Masuk →</button>
+      <div class="or-sep">atau</div>
+      <button class="btn-google" id="btn-google-login" onclick="doGoogleLogin()"><div class="g-icon"></div>Lanjut dengan Google</button>
+    </div>
+
+    <!-- REGISTER -->
+    <div id="form-reg" style="display:none">
+      <div class="auth-field"><label>Nama Panggilan</label><input type="text" id="r-name" placeholder="Nama kamu"></div>
+      <div class="auth-field"><label>Email</label><input type="email" id="r-email" placeholder="email@kamu.com"></div>
+      <div class="auth-field"><label>Password</label><input type="password" id="r-pass" placeholder="Min. 8 karakter" onkeydown="if(event.key==='Enter')doEmailRegister()"></div>
+      <button class="btn-primary" id="btn-email-reg" onclick="doEmailRegister()">Buat Akun →</button>
+      <div class="or-sep">atau</div>
+      <button class="btn-google" id="btn-google-reg" onclick="doGoogleRegister()"><div class="g-icon"></div>Daftar dengan Google</button>
+      <div class="auth-note">Dengan mendaftar, data jurnalmu tersimpan aman di cloud Firebase dan hanya bisa diakses oleh kamu.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ════ APP ════ -->
+<div id="app" style="display:none;flex-direction:column;min-height:100vh">
+  <div class="topbar">
+    <div class="topbar-logo">lazy<span>trader</span></div>
+    <div class="topbar-acct"><strong id="topbar-acct-name">—</strong></div>
+    <button class="nav-btn active" id="nav-dashboard" onclick="goPage('dashboard')">📊 Dashboard</button>
+    <button class="nav-btn" id="nav-journal" onclick="goPage('journal')">✏️ Jurnal</button>
+    <button class="nav-btn" id="nav-history" onclick="goPage('history')">📋 Riwayat</button>
+    <button class="nav-btn" id="nav-analytics" onclick="goPage('analytics')">📈 Analitik</button>
+    <button class="nav-btn" id="nav-accounts" onclick="goPage('accounts')">📂 Akun</button>
+    <button class="avatar-btn" id="avatar-btn" onclick="toggleProfilePanel()">LT</button>
+  </div>
+
+  <div class="content">
+
+    <!-- ═══ DASHBOARD ═══ -->
+    <div class="page active" id="page-dashboard">
+
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="font-size:21px;font-weight:600" id="dash-acct-name">Dashboard</h2>
+          <div style="font-size:13px;color:var(--text3)">Performa trading kamu</div>
+        </div>
+        <button class="nav-btn active" style="font-size:13px;padding:8px 16px" onclick="goPage('journal')">✏️ + Jurnal Baru</button>
+      </div>
+
+      <div class="stats-grid">
+        <div class="stat-card"><div class="stat-label">Total Trade</div><div class="stat-val accent" id="s-total">0</div><div class="stat-sub">tercatat</div></div>
+        <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-val green" id="s-wr">0%</div><div class="stat-sub">dari semua trade</div></div>
+        <div class="stat-card"><div class="stat-label">Avg Grade</div><div class="stat-val amber" id="s-grade">—</div><div class="stat-sub">dari skala 1–5</div></div>
+        <div class="stat-card"><div class="stat-label">Emosi Terbaik</div><div class="stat-val green" id="s-best" style="font-size:16px;margin-top:6px">—</div><div class="stat-sub">win rate tertinggi</div></div>
+      </div>
+
+      <div id="dashboard-empty" class="empty-state" style="display:none">
+        <div class="empty-icon">📓</div>
+        <p>Belum ada jurnal di akun ini.<br>Klik <strong style="color:var(--accent)">✏️ Jurnal Baru</strong> untuk mulai mencatat!</p>
+      </div>
+
+      <div id="dashboard-charts" style="display:none">
+        <div class="charts-row">
+          <div class="chart-card">
+            <div class="chart-title">Emosi sebelum vs hasil</div>
+            <div id="donut-area" class="donut-wrap"></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-title">Win rate per emosi sebelum</div>
+            <div id="bar-chart-area" class="bar-chart"></div>
+          </div>
+        </div>
+        <div class="section-label">Trade Terbaru</div>
+        <div class="trades-list" id="recent-trades"></div>
+      </div>
+    </div>
+
+    <!-- ═══ JOURNAL FORM ═══ -->
+    <div class="page" id="page-journal">
+      <div class="page-header">
+        <h2 id="form-title">Jurnal Trade Baru</h2>
+        <p>Tulis reason & emosi SEBELUM liat hasil. Jujur ya, ini buat kamu sendiri!</p>
+      </div>
+
+      <div class="form-grid">
+        <div class="form-field" style="margin-bottom:0">
+          <label>Tanggal <span class="req">*</span></label>
+          <input type="date" id="f-date">
+        </div>
+        <div class="form-field" style="margin-bottom:0">
+          <label>Pair / Aset <span class="req">*</span></label>
+          <input type="text" id="f-pair" placeholder="BTC, XAUUSD, NQ100...">
+        </div>
+      </div>
+      <div style="margin-bottom:14px"></div>
+
+      <div class="form-field">
+        <label>Reason Entry <span class="req">*</span></label>
+        <textarea id="f-reason" placeholder="Setup kamu secara jujur SEBELUM entry. Kenapa masuk? Setupnya jelas? FOMO? Berapa R:R?"></textarea>
+      </div>
+
+      <div class="form-field">
+        <label>Emosi Sebelum Trade <span class="req">*</span></label>
+        <div class="emotion-picker" id="emo-before-picker"></div>
+        <textarea id="f-emo-before-desc" placeholder="Deskripsi emosi kamu (opsional)"></textarea>
+      </div>
+
+      <hr class="form-sep">
+      <div class="form-section-lbl">Isi setelah trade selesai</div>
+
+      <div class="form-field">
+        <label>Hasil Trade</label>
+        <div class="result-toggle">
+          <button class="result-btn" id="btn-win" onclick="selectResult('win')">✅ Win / TP</button>
+          <button class="result-btn" id="btn-loss" onclick="selectResult('loss')">❌ Loss / SL</button>
+          <button class="result-btn" id="btn-be" onclick="selectResult('be')">〰️ Break Even</button>
+        </div>
+      </div>
+
+      <div class="form-field">
+        <label>Emosi Sesudah Trade</label>
+        <div class="emotion-picker" id="emo-after-picker"></div>
+        <textarea id="f-emo-after-desc" placeholder="Perasaan setelah trade ini (opsional)"></textarea>
+      </div>
+
+      <div class="form-field">
+        <label>Pelajaran dari Trade Ini</label>
+        <textarea id="f-lesson" placeholder="1 kalimat aja. Misal: Jangan entry kalau belum ada konfirmasi volume."></textarea>
+      </div>
+
+      <div class="form-field">
+        <label>Grade Kualitas Trade (1–5)</label>
+        <div class="grade-picker" id="grade-picker">
+          <button class="grade-btn" onclick="selectGrade(1)">1</button>
+          <button class="grade-btn" onclick="selectGrade(2)">2</button>
+          <button class="grade-btn" onclick="selectGrade(3)">3</button>
+          <button class="grade-btn" onclick="selectGrade(4)">4</button>
+          <button class="grade-btn" onclick="selectGrade(5)">5</button>
+        </div>
+        <div class="grade-hint">1 = eksekusi jelek &nbsp;|&nbsp; 5 = perfect execution sesuai plan</div>
+      </div>
+
+      <button class="submit-btn" id="btn-submit" onclick="submitJournal()">SIMPAN JURNAL →</button>
+    </div>
+
+    <!-- ═══ HISTORY ═══ -->
+    <div class="page" id="page-history">
+      <div class="history-hdr">
+        <h2>Riwayat Trade</h2>
+        <input class="search-inp" type="text" id="search-input" placeholder="Cari pair, emosi, pelajaran..." oninput="filterHistory()">
+        <select class="filter-sel" id="filter-result" onchange="filterHistory()">
+          <option value="">Semua hasil</option>
+          <option value="win">Win</option>
+          <option value="loss">Loss</option>
+          <option value="be">Break Even</option>
+        </select>
+      </div>
+      <div class="trades-list" id="history-list"></div>
+    </div>
+
+    <!-- ═══ ANALYTICS ═══ -->
+    <div class="page" id="page-analytics">
+      <div class="page-header">
+        <h2>Analitik</h2>
+        <p>Pola tersembunyi dari jurnal kamu</p>
+      </div>
+      <div id="analytics-empty" class="empty-state" style="display:none">
+        <div class="empty-icon">📊</div>
+        <p>Tambah minimal 3 jurnal untuk melihat analitik.</p>
+      </div>
+      <div id="analytics-content">
+        <div class="analytics-grid">
+          <div class="chart-card"><div class="chart-title">Distribusi emosi sebelum</div><canvas id="chart-emo-dist"></canvas></div>
+          <div class="chart-card"><div class="chart-title">Win rate % per emosi sebelum</div><canvas id="chart-emo-wr"></canvas></div>
+        </div>
+        <div class="analytics-grid">
+          <div class="chart-card"><div class="chart-title">Distribusi grade trade</div><canvas id="chart-grades"></canvas></div>
+          <div class="chart-card"><div class="chart-title">Emosi sesudah vs avg grade</div><canvas id="chart-after-grade"></canvas></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ ACCOUNTS PAGE ═══ -->
+    <div class="page" id="page-accounts">
+      <div class="page-header">
+        <h2>Kelola Akun Jurnal</h2>
+        <p>Buat akun terpisah untuk tiap strategi, pair, atau challenge kamu</p>
+      </div>
+      <div id="accounts-list"></div>
+      <button class="btn-new-acct" onclick="openModal('modal-new-acct')">＋ Buat Akun Baru</button>
+    </div>
+
+  </div><!-- /content -->
+</div><!-- /app -->
+
+<!-- ════ MODAL: New Account ════ -->
+<div class="modal-overlay" id="modal-new-acct">
+  <div class="modal-box">
+    <h3>Buat Akun Jurnal Baru</h3>
+    <p>Tiap akun punya jurnal terpisah. Misal: akun khusus BTC, akun FTMO challenge, dll.</p>
+    <div class="auth-field"><label>Nama Akun <span class="req">*</span></label>
+      <input class="modal-inp" id="new-acct-name" placeholder="Misal: BTC Scalping, FTMO Challenge 100K..." style="margin-bottom:0" onkeydown="if(event.key==='Enter')createAccount()">
+    </div>
+    <div class="auth-field" style="margin-top:12px"><label>Deskripsi (opsional)</label>
+      <input class="modal-inp" id="new-acct-desc" placeholder="Strategi / pair fokus..." style="margin-bottom:0">
+    </div>
+    <div class="modal-btns" style="margin-top:20px">
+      <button class="btn-cancel" onclick="closeModal('modal-new-acct')">Batal</button>
+      <button class="btn-confirm" id="btn-create-acct" onclick="createAccount()">Buat Akun</button>
+    </div>
+  </div>
+</div>
+
+<!-- ════ MODAL: Add Emotion ════ -->
+<div class="modal-overlay" id="modal-emo">
+  <div class="modal-box">
+    <h3>Tambah Emosi Baru</h3>
+    <p>Emosi ini tersimpan di akun kamu dan tersedia di semua form jurnal.</p>
+    <input class="modal-inp" id="new-emo-input" placeholder="Nama emosi — misal: overthinking" maxlength="25">
+    <div class="modal-btns">
+      <button class="btn-cancel" onclick="closeModal('modal-emo')">Batal</button>
+      <button class="btn-confirm" onclick="addEmotion()">Tambah</button>
+    </div>
+  </div>
+</div>
+
+<!-- ════ MODAL: Trade Detail ════ -->
+<div class="modal-overlay" id="modal-detail">
+  <div class="modal-box" style="max-width:520px">
+    <div class="modal-hdr">
+      <h3 id="detail-title">Detail Trade</h3>
+      <button class="btn-close" onclick="closeModal('modal-detail')">✕</button>
+    </div>
+    <div id="detail-body"></div>
+  </div>
+</div>
+
+<!-- ════ CUSTOM CONFIRM MODAL ════ -->
+<div id="confirm-overlay">
+  <div class="confirm-box">
+    <div class="confirm-icon" id="confirm-icon">🗑️</div>
+    <div class="confirm-title" id="confirm-title">Yakin?</div>
+    <div class="confirm-msg" id="confirm-msg">Tindakan ini tidak bisa dibatalkan.</div>
+    <div class="confirm-btns">
+      <button class="btn-confirm-cancel" onclick="closeConfirm()">Batal</button>
+      <button class="btn-confirm-ok danger" id="confirm-ok-btn" onclick="triggerConfirm()">Hapus</button>
+    </div>
+  </div>
+</div>
+
+<!-- ════ PROFILE PANEL ════ -->
+<div id="panel-backdrop" onclick="closeProfilePanel()"></div>
+<div id="profile-panel">
+  <div class="panel-header">
+    <h3>Profil Saya</h3>
+    <button class="panel-close" onclick="closeProfilePanel()">✕</button>
+  </div>
+  <div class="panel-body">
+    <!-- Avatar & Info -->
+    <div class="panel-avatar-section">
+      <div class="panel-avatar-big" id="panel-avatar-big" onclick="document.getElementById('avatar-file-input').click()">
+        <span id="panel-avatar-initials">LT</span>
+        <div class="avatar-overlay">📷<span style="font-size:9px">Ganti Foto</span></div>
+      </div>
+      <input type="file" id="avatar-file-input" accept="image/*" style="display:none" onchange="handleAvatarUpload(this)">
+      <div>
+        <div class="panel-user-name" id="panel-user-name">Trader</div>
+        <div class="panel-user-email" id="panel-user-email">—</div>
+      </div>
+    </div>
+
+    <!-- Edit Name -->
+    <div class="panel-section-title">Edit Profil</div>
+    <div class="panel-field">
+      <label>Nama Tampilan</label>
+      <input type="text" id="panel-name-input" placeholder="Nama kamu">
+    </div>
+    <button class="btn-save-profile" onclick="saveProfile()">Simpan Perubahan</button>
+
+    <hr class="panel-divider">
+
+    <!-- Menu -->
+    <div class="panel-section-title">Pengaturan</div>
+    <button class="panel-menu-item" onclick="goPage('accounts');closeProfilePanel()">
+      <span class="menu-icon">📂</span> Kelola Akun Jurnal
+    </button>
+    <button class="panel-menu-item" onclick="goPage('analytics');closeProfilePanel()">
+      <span class="menu-icon">📊</span> Lihat Statistik
+    </button>
+
+    <hr class="panel-divider">
+  </div>
+
+  <div class="panel-footer">
+    <button class="panel-menu-item danger" onclick="doLogout()">
+      <span class="menu-icon">🚪</span> Logout
+    </button>
+  </div>
+</div>
+
+<!-- ════ TOAST ════ -->
+<div id="toast"></div>
+
+<script>
+// Fallback: if loading overlay stuck after 5s, show auth screen
+window.addEventListener('load', () => {
+  setTimeout(() => {
+    const overlay = document.getElementById('loading-overlay');
+    if (overlay && overlay.style.display !== 'none') {
+      overlay.style.display = 'none';
+      document.getElementById('auth-screen').style.display = 'flex';
+    }
+  }, 5000);
+});
+</script>
+</body>
+</html>
